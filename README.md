@@ -10,7 +10,7 @@ This is the official implementation of papers
 ![Overall architecture of proposed monocular pose estimation approach. Given an input image, the satellite is first detected and then the image
 is cropped and resized. A random zoom-in technique is applied during training to reduce the impact of detection instability on the keypoint-set
 predictor. The transformer-based keypoint-set predictor takes a fixed-size image as input and outputs the set of predefined keypoints. The pose of the
-satellite is then estimated using PnP with the predefined 3-D points.]()
+satellite is then estimated using PnP with the predefined 3-D points.](assert/revist_overall.png)
 
 ![Overall architecture of the proposed monocular pose estimation approach. Given an input image, the satellite is first cropped and resized. The
 transformer-based keypoint-set predictor takes a fixed-size image as input and outputs the set of predefined keypoints and their Gaussian distributions.
