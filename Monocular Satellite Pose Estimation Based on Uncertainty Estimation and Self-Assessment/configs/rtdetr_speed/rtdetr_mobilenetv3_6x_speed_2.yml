@@ -1,0 +1,88 @@
+
+__include__: [
+  '../dataset/speed_landmark.yml',
+  '../runtime.yml',
+  './include/optimizer.yml',
+  './include/rtdetr_mobilenet.yml',
+]
+
+num_classes: 11
+epoches: 192
+
+checkpoint_step: 32
+log_step: 100
+sync_bn: False
+output_dir: output/rtdetr_mobilenetv3_6x_speed_2_Large
+scaler:
+  type: GradScaler
+  enabled: False
+
+train_dataloader: 
+  batch_size: 50
+  num_workers: 4
+  dataset:
+    resize: 256
+    #index_file: train_9000_1000/train_2_9000.txt
+    index_file: train_2.txt
+
+
+val_dataloader:
+  batch_size: 50
+  num_workers: 4
+  dataset:
+    resize: 256
+    index_file: val_2.txt
+    #index_file: train_9000_1000/train_2_1000.txt
+
+MobileNetV3_Large:
+#MobileNetV3_Small:
+#PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  #pretrained: True
+
+HybridEncoder:
+  use_encoder_idx: [-1]
+  #in_channels: [512]
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+  eval_spatial_size: [256, 256]
+
+
+RTDETRTransformer:
+  eval_idx: -1
+  feat_channels: [256,256,256]
+  num_decoder_layers: 3
+  num_denoising: 0
+  num_queries: 30
+  eval_spatial_size: [256, 256]
+
+SetCriterion:
+  weight_dict: {loss_ce: 1, loss_bbox: 2}
+  losses: ['labels', 'points']
+
+
+optimizer:
+  type: AdamW
+  params: 
+    - 
+      params: '^(?=.*backbone)(?=.*norm).*$'
+      lr: 0.00003
+      weight_decay: 0.
+    - 
+      params: '^(?=.*backbone)(?!.*norm).*$'
+      lr: 0.00003
+    - 
+      params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0003
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [96]
+  gamma: 0.1

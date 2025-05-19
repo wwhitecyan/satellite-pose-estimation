@@ -1,0 +1,35 @@
+task: landmarker
+
+num_classes: 11
+remap_mscoco_category: True
+
+train_dataloader: 
+  type: DataLoader
+  dataset: 
+    type: SpeedTrain
+    img_dir: images/train
+    ann_file: wz_train.json
+    index_file: train_1.txt
+    resize: 256
+    train: True
+  shuffle: True
+  batch_size: 8
+  num_workers: 4
+  drop_last: True 
+  collate_fn: speed_collate_fn
+
+
+val_dataloader:
+  type: DataLoader
+  dataset: 
+    type: SpeedTrain
+    img_dir: images/train
+    ann_file: wz_train.json
+    index_file: val_1.txt
+    resize: 256
+    train: False
+  shuffle: False
+  batch_size: 8
+  num_workers: 4
+  drop_last: False
+  collate_fn: speed_collate_fn
