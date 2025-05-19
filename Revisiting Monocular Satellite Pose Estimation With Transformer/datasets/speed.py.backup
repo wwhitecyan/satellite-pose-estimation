@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# File              : speed.py
+# Author            : WangZi <wangzitju@163.com>
+# Date              : 21.11.2020
+# Last Modified Date: 03.12.2020
+# Last Modified By  : WangZi <wangzitju@163.com>
+import json
+import os.path as osp
+import numpy as np
+from PIL import Image
+from scipy import stats
+import cv2
+
+import torch
+from torch.utils.data import Dataset
+import albumentations as A
+import torchvision.transforms.functional as F
+from utils.speed_eval import speed_score
+
+
+DATA_ROOT = './data/speed'
+
+
+class Normalize(object):
+    def __init__(self, mean, std, size=512):
+        self.mean = mean
+        self.std = std
+        self.size = size
+
+    def __call__(self, image, landmarks=None):
+        """
+        image: tensor CxHxW
+        landmarks: tensors: 11x2
+        """
+        image = F.normalize(image, mean=self.mean, std=self.std)
+        if landmarks is None:
+            return image, None
+
+        landmarks = landmarks / self.size
+        return image, landmarks
+
+
+class SpeedSubmission(Dataset):
+    def __init__(self, ann_file, img_dir, resize=512):
+
+        self.ann_file, self.img_dir = ann_file, img_dir
+        self.resize = resize
+        self.transforms = A.Compose(
+            [
+                A.Resize(resize, resize, cv2.INTER_CUBIC)
+            ],
+        )
+        self.normalize = Normalize(
+            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225], resize)
+
+        self.data_infos = self.load_anns()
+
+    def load_anns(self):
+        """ read detection result from mmdetection
+        Input:
+            {
+                "img000424real.jpg": [[x1, y1, x2, y2, score]],
+            }
+        Return:
+            [
+                {'filename': 'img000231.jpg', 'bbox_xxyy': [x1, y1, x2, y2],
+                .
+                .
+            ]
+        """
+        with open(osp.join(DATA_ROOT, 'annos', self.ann_file), 'r') as f:
+            anns = json.load(f)
+
+        out = []
+        for filename, bbox_score in anns.items():
+            out.append({
+                'filename': filename,
+                'bbox_xxyy': bbox_score[0][:4]
+            })
+
+        return out
+
+    def generate_clip_bbox(self, bbox, image_size):
+        x1, y1, x2, y2 = bbox
+        bbox_width, bbox_height = x2 - x1, y2 - y1
+        scale = max(bbox_width, bbox_height) * 1.2
+
+        x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
+        half_scale = scale / 2
+
+        x1, x2 = x_center - half_scale, x_center + half_scale
+        y1, y2 = y_center - half_scale, y_center + half_scale
+        bbox_clip = np.asarray([x1, y1, x2, y2])
+
+        bbox_clip[0::2] = bbox_clip[0::2].clip(min=0, max=image_size[0])
+        bbox_clip[1::2] = bbox_clip[1::2].clip(min=0, max=image_size[1])
+        return bbox_clip
+
+    def __len__(self):
+        return len(self.data_infos)
+
+    def __getitem__(self, idx):
+        data_info = self.data_infos[idx]
+        img_path = osp.join(DATA_ROOT, self.img_dir, data_info['filename'])
+        img = Image.open(img_path).convert('RGB')
+
+        bbox_xxyy = data_info['bbox_xxyy']
+        bbox_clip = self.generate_clip_bbox(bbox_xxyy, img.size)
+        cropImg = np.asarray(img.crop(bbox_clip))
+        if self.transforms:
+            transformed = self.transforms(
+                image=cropImg)
+            cropImg = transformed['image']
+        cropImg = torch.from_numpy(
+            cropImg).to(torch.float).permute(2, 0, 1) / 255
+        cropImg, _ = self.normalize(cropImg)
+
+        target = {
+            "clip_bbox": torch.as_tensor(bbox_clip),
+            "filename": data_info['filename']
+        }
+
+        return cropImg, target
+
+
+class SpeedTrain(Dataset):
+    def __init__(self, ann_file, index_file, img_dir,
+                 resize=512, train=True, transforms=None):
+        super(SpeedTrain, self).__init__()
+        self.ann_file, self.img_dir = ann_file, img_dir
+        self.index_file, self.transforms = index_file, transforms
+        self.train, self.resize = train, resize
+
+        self.data_infos = self.load_anns()
+        self.normalize = Normalize(
+            [0.485, 0.456, 0.406], [0.229, 0.224, 0.225], resize)
+
+    def load_anns(self):
+        with open(osp.join(DATA_ROOT, 'annos', self.ann_file), 'r') as f:
+            anns = json.load(f)
+
+        indexs = np.loadtxt(
+            osp.join(DATA_ROOT, 'annos', self.index_file), dtype=int)
+
+        return [anns[item] for item in indexs.tolist()]
+
+    def __getitem__(self, idx):
+        data_info = self.data_infos[idx]
+        img_path = osp.join(DATA_ROOT, self.img_dir, data_info['filename'])
+        img = Image.open(img_path).convert('RGB')
+
+        # qua, tra = data_info['q_vbs2tango'], data_info['r_Vo2To_vbs_true']
+        landmarks = np.asarray(data_info['landmarks'])  # 11 x 2
+        bbox_xxyy = data_info['bbox_xxyy']
+
+        if self.train:
+            bbox_clip = self.generate_clip_bbox_train(bbox_xxyy, img.size)
+        else:
+            bbox_clip = self.generate_clip_bbox_val(bbox_xxyy, img.size)
+        landmarks[:, :2] -= bbox_clip[:2]
+        cropImg = np.asarray(img.crop(bbox_clip))
+
+        if self.transforms:
+            transformed = self.transforms(
+                image=cropImg, keypoints=landmarks)
+            cropImg, landmarks = transformed['image'], transformed['keypoints']
+
+        cropImg = torch.from_numpy(
+            cropImg).to(torch.float).permute(2, 0, 1) / 255
+        landmarks = torch.as_tensor(landmarks)
+        cropImg, landmarks = self.normalize(cropImg, landmarks)
+
+        target = {
+            "landmarks": landmarks.to(torch.float32),
+            "clip_bbox": torch.as_tensor(bbox_clip),
+            "labels": torch.arange(0, 11, dtype=torch.int64),
+            "filename": data_info['filename']
+        }
+
+        return cropImg, target
+
+    def generate_clip_bbox_val(self, bbox, image_size):
+        x1, y1, x2, y2 = bbox
+        bbox_width, bbox_height = x2 - x1, y2 - y1
+        scale = max(bbox_width, bbox_height) * 1.2
+
+        x_center, y_center = (x1 + x2) / 2, (y1 + y2) / 2
+        half_scale = scale / 2
+
+        x1, x2 = x_center - half_scale, x_center + half_scale
+        y1, y2 = y_center - half_scale, y_center + half_scale
+        bbox_clip = np.asarray([x1, y1, x2, y2])
+
+        bbox_clip[0::2] = bbox_clip[0::2].clip(min=0, max=image_size[0])
+        bbox_clip[1::2] = bbox_clip[1::2].clip(min=0, max=image_size[1])
+        return bbox_clip
+
+    def generate_clip_bbox_train(self, bbox, image_size):
+        """
+        generate clip bboxes
+        bbox: (4,), x1y1x2y2
+        image_size: (width, height)
+        return: np.ndarray nx4
+        """
+        alpha = 0.2
+        beta = 0.2
+        center = np.asarray(
+            [(bbox[0] + bbox[2]) / 2., (bbox[1] + bbox[3]) / 2.])
+
+        bbox_width, bbox_height = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        scale = max(bbox_width, bbox_height) * 1.2
+
+        # truncnorm
+        # 1 x_center
+        x_center = int(truncnorm(center[0], bbox_width * alpha))
+        y_center = int(truncnorm(center[1], bbox_height * alpha))
+        scale = int(truncnorm(scale, scale * beta))
+        half_scale = np.ceil(scale / 2.)
+
+        x1, x2 = x_center - half_scale, x_center + half_scale
+        y1, y2 = y_center - half_scale, y_center + half_scale
+
+        bbox_clip = np.asarray([x1, y1, x2, y2])
+
+        bbox_clip[0::2] = bbox_clip[0::2].clip(min=0, max=image_size[0])
+        bbox_clip[1::2] = bbox_clip[1::2].clip(min=0, max=image_size[1])
+        return bbox_clip
+
+    def __len__(self):
+        return len(self.data_infos)
+
+
+def truncnorm(loc, clip):
+    mu, sigma = loc, clip / 3
+    lower, upper = mu - 3 * sigma, mu + 3 * sigma  # 截断在[μ-3σ, μ+3σ]
+    X = stats.truncnorm(
+        (lower - mu) / sigma, (upper - mu) / sigma, loc=mu, scale=sigma)
+    x = X.rvs(1)
+    return x
+
+
+def make_transforms(train=True, img_size=512):
+    if train:
+        return A.Compose(
+            [
+                A.HorizontalFlip(p=0.5),
+                A.IAAAffine(p=.1, mode='constant'),
+                A.Rotate(p=0.4,
+                         interpolation=cv2.INTER_CUBIC,
+                         border_mode=cv2.BORDER_CONSTANT),
+                A.Resize(img_size, img_size, cv2.INTER_CUBIC),
+                A.Blur(p=.3, blur_limit=3),
+                A.OneOf([
+                    A.MotionBlur(p=.2),
+                    A.MedianBlur(blur_limit=3, p=0.1),
+                    A.Blur(blur_limit=3, p=0.1),
+                ], p=0.2),
+                A.IAAAdditiveGaussianNoise(p=0.2),
+                A.JpegCompression(20, 99, p=.1),
+                A.ISONoise(p=.2),
+                A.Cutout(num_holes=10, max_h_size=20, max_w_size=20, p=.1),
+            ],
+            keypoint_params=A.KeypointParams('xy', remove_invisible=False),
+        )
+    else:
+        return A.Compose(
+            [
+                A.Resize(img_size, img_size, cv2.INTER_CUBIC)
+            ], keypoint_params=A.KeypointParams('xy', remove_invisible=False),
+        )
+
+
+class SpeedEval(object):
+    def __init__(self, gt_file, solver):
+        self.solver = solver
+
+        with open(osp.join(DATA_ROOT, gt_file), 'r') as f:
+            ground_truth = json.load(f)
+
+        self.ground_truth = {
+            item['filename']:
+            {'quat': item['q_vbs2tango'],
+             'tvec': item['r_Vo2To_vbs_true']} for item in ground_truth
+        }
+        self.log = {}
+
+    def update(self, predictions):
+        for filename, ret in predictions.items():
+            try:
+                quat_pr, tvec_pr = self.solver(ret['points'], ret['logits'])
+            # except cv2.error or IndexError as e:
+            except IndexError as e:
+                quat_pr, tvec_pr = np.zeros(4), np.zeros(3)
+                # print('{:s}: '.format(filename), end='')
+                # print(e)
+            except cv2.error as e:
+                quat_pr, tvec_pr = np.zeros(4), np.zeros(3)
+                # print('{:s}: '.format(filename), end='')
+                # print(e)
+
+            quat_gt = self.ground_truth[filename]['quat']
+            tvec_gt = self.ground_truth[filename]['tvec']
+
+            score_tvec, score_quat = speed_score(
+                quat_pr, tvec_pr, quat_gt, tvec_gt)
+            self.log[filename] = {
+                'points': np.around(ret['points'], decimals=2).tolist(),
+                'logits': np.around(ret['logits'], decimals=6).tolist(),
+                'quat_gt': quat_gt,
+                'tvec_gt': tvec_gt,
+                'quat_pr': np.around(quat_pr, decimals=6).tolist(),
+                'tvec_pr': np.around(tvec_pr, decimals=6).tolist(),
+                'score_tvec': np.around(score_tvec, decimals=8).item(),
+                'score_quat': np.around(score_quat, decimals=8).item(),
+                'score': np.around(score_quat + score_tvec, decimals=8).item(),
+            }
+
+    def summarize(self):
+        scores = np.asarray(
+            [item['score'] for filename, item in self.log.items()])
+        tvec_score = np.asarray(
+            [item['score_tvec'] for filename, item in self.log.items()])
+        quat_score = np.asarray(
+            [item['score_quat'] for filename, item in self.log.items()])
+
+        tvec_abs = np.stack([
+            np.abs(
+                np.asarray(item['tvec_pr']) - np.asarray(item['tvec_gt'])
+            )
+            for _, item in self.log.items()
+        ])
+
+        scores = np.mean(scores).item()
+        tvec_score = np.mean(tvec_score).item()
+        quat_score = np.mean(quat_score).item()
+
+        # score (mean)
+        self.stats = "tvec score: {:.6f}, "\
+            "quat score: {:.6f}, final score: {:.6f}; ".format(
+                tvec_score, quat_score, scores
+            )
+
+        # median error
+        self.stats = self.stats + "median tvec: {:.6f}, "\
+            "median quat: {:.6f}; ".format(
+                np.median(tvec_score).item(),
+                np.median(quat_score).item()
+            )
+
+        tvec_abs_mean = np.mean(tvec_abs, 0).tolist()
+        tvec_abs_median = np.median(tvec_abs, 0).tolist()
+        # tvec abs
+        self.stats = self.stats + "mean tvec abs: "\
+            "[{:.6f}, {:.6f}, {:.6f}], median tvec abs:"\
+            "[{:.6f}, {:.6f}, {:.6f}]".format(
+                *(tvec_abs_mean + tvec_abs_median)
+            )
